@@ -4,6 +4,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F
@@ -11,42 +13,52 @@ from aiogram.types import Message
 from dotenv import load_dotenv
 from vosk import Model, KaldiRecognizer
 
-# --- Загрузка переменных окружения ---
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
 if not TELEGRAM_TOKEN:
-    raise SystemExit("❌ TELEGRAM_BOT_TOKEN не найден в .env")
+    raise SystemExit("TELEGRAM_BOT_TOKEN не найден")
+
+# --- Заглушка HTTP-сервера для Render ---
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Bot is running")
+
+        def log_message(self, *args):
+            pass  # не засоряем логи
+
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"[HTTP] Health-сервер запущен на порту {port}")
 
 # --- Инициализация бота ---
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# --- Путь к модели Vosk (малая версия) ---
 MODEL_PATH = "vosk-model-small-ru-0.22"
 
-# --- Путь к ffmpeg: Windows или Linux ---
 if sys.platform == "win32":
     FFMPEG_PATH = os.path.abspath("ffmpeg.exe")
 else:
     FFMPEG_PATH = os.path.abspath("ffmpeg")
 
 if not os.path.exists(FFMPEG_PATH):
-    raise SystemExit(f"❌ Не найден ffmpeg: {FFMPEG_PATH}")
+    raise SystemExit(f"Не найден ffmpeg: {FFMPEG_PATH}")
 
 if not os.path.exists(MODEL_PATH):
-    raise SystemExit(f"❌ Не найдена папка модели: {MODEL_PATH}")
+    raise SystemExit(f"Не найдена папка модели: {MODEL_PATH}")
 
-print("⏳ Загружаю модель Vosk...")
+print("Загружаю модель Vosk...")
 model = Model(MODEL_PATH)
-print("✅ Модель загружена.")
+print("Модель загружена.")
 
 
 def convert_ogg_to_wav_16k(ogg_bytes: bytes) -> bytes:
-    """
-    Конвертирует OGG/OPUS в WAV 16kHz mono через ffmpeg напрямую.
-    Возвращает байты WAV.
-    """
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f_in:
         f_in.write(ogg_bytes)
         in_path = f_in.name
@@ -64,12 +76,7 @@ def convert_ogg_to_wav_16k(ogg_bytes: bytes) -> bytes:
             "-acodec", "pcm_s16le",
             out_path,
         ]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
             print(f"[FFMPEG STDERR]\n{result.stderr}")
             raise RuntimeError(f"ffmpeg вернул код {result.returncode}")
@@ -79,7 +86,6 @@ def convert_ogg_to_wav_16k(ogg_bytes: bytes) -> bytes:
 
         print(f"[DEBUG] WAV сконвертирован: {len(wav_bytes)} байт")
         return wav_bytes
-
     finally:
         for p in (in_path, out_path):
             try:
@@ -88,53 +94,43 @@ def convert_ogg_to_wav_16k(ogg_bytes: bytes) -> bytes:
                 pass
 
 
-def wav_duration_sec(wav_bytes: bytes) -> float:
-    """Длительность WAV в секундах (16kHz mono 16-bit)."""
-    data_size = len(wav_bytes) - 44
-    return data_size / (16000 * 2)
-
-
 @dp.message(F.voice)
 async def handle_voice(message: Message):
-    await message.answer("🎧 Слушаю...")
-
+    await message.answer("Слушаю...")
     try:
-        # 1. Скачиваем OGG/OPUS в память
         file_info = await bot.get_file(message.voice.file_id)
         raw_buffer = BytesIO()
         await bot.download_file(file_info.file_path, destination=raw_buffer)
         ogg_bytes = raw_buffer.getvalue()
-        print(f"\n[DEBUG] Получено голосовое: {len(ogg_bytes)} байт")
+        print(f"[DEBUG] Получено голосовое: {len(ogg_bytes)} байт")
 
-        # 2. Конвертируем через ffmpeg в WAV 16kHz mono
         wav_bytes = convert_ogg_to_wav_16k(ogg_bytes)
-        print(f"[DEBUG] Длительность WAV: {wav_duration_sec(wav_bytes):.2f} сек")
 
-        # 3. Распознаём
         rec = KaldiRecognizer(model, 16000)
         rec.AcceptWaveform(wav_bytes)
         result = json.loads(rec.FinalResult())
         print(f"[DEBUG] Результат Vosk: {result}")
 
         text = result.get("text", "").strip()
-
         if text:
-            await message.answer(f"📝 {text}")
+            await message.answer(f"{text}")
         else:
-            await message.answer("🤷 Не удалось распознать. Говори громче и чётче.")
-
+            await message.answer("Не удалось распознать. Говори громче и чётче.")
     except Exception as e:
         print(f"[ERROR] {type(e).__name__}: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
+        await message.answer(f"Ошибка: {e}")
 
 
 @dp.message(F.text)
 async def handle_text(message: Message):
-    await message.answer("Отправь голосовое 🎤 — переведу в текст.")
+    await message.answer("Отправь голосовое — переведу в текст.")
 
 
 async def main():
-    print("🚀 Бот запущен. Жду сообщения...")
+    # Запускаем HTTP-заглушку ДО polling, чтобы Render увидел порт
+    start_health_server()
+
+    print("Бот запущен. Жду сообщения...")
     await dp.start_polling(bot)
 
 
